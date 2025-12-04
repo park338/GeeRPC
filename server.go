@@ -4,6 +4,7 @@ import (
 	"codec/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"io"
 	"log"
@@ -12,19 +13,23 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber int        //辨别rpc请求
-	CodecType   codec.Type //编解码的类型
+	MagicNumber    int           //辨别rpc请求
+	CodecType      codec.Type    //编解码的类型
+	ConnectTimeout time.Duration //连接超时时间
+	HandleTimeout  time.Duration
 }
 
 // 默认规则
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 // 方法的结构体
@@ -214,7 +219,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			server.sendResponse(cc, req.h, invalidRequest, sending)
 		}
 		wg.Add(1)
-		server.handlerRequest(cc, req, sending, wg)
+		server.handlerRequest(cc, req, sending, wg, time.Second*10)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -274,13 +279,32 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 }
 
 // 处理请求
-func (server *Server) handlerRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handlerRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("服务端处理超时 %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
