@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	GeeRPC "codec"
 	"codec/codec"
 	"context"
@@ -10,8 +11,16 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geeprc_"
+	defaultDebugPath = "/debug/geerpc"
 )
 
 // 单个请求call
@@ -133,7 +142,7 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
-// 初始化client
+// tcp初始化client
 func NewClient(conn net.Conn, opt *GeeRPC.Option) (*Client, error) {
 	f := codec.NewCodeFuncMap[opt.CodecType]
 	if f == nil {
@@ -177,6 +186,7 @@ func parseOptions(opts ...*GeeRPC.Option) (*GeeRPC.Option, error) {
 	return opt, nil
 }
 
+// 普通tcp连接服务端
 func dialTimeout(f newClientFunc, network, address string, opts ...*GeeRPC.Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
@@ -210,9 +220,42 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*GeeRPC.Optio
 
 }
 
-// 连接服务端
+// http连接初始化
+func NewHTTPClient(conn net.Conn, opt *GeeRPC.Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("HTTP 响应错误" + resp.Status)
+	}
+	return nil, err
+}
+
+// http连接服务端
+func DialHTTP(network, address string, opts ...*GeeRPC.Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// 普通tcp连接服务端
 func Dial(network, address string, opts ...*GeeRPC.Option) (client *Client, err error) {
 	return dialTimeout(NewClient, network, address, opts...)
+}
+
+// 统一连接函数
+func XDial(rpcAddr string, opts ...*GeeRPC.Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc 地址名格式错误%s", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		return Dial(protocol, addr, opts...)
+	}
 }
 
 // 发送请求
